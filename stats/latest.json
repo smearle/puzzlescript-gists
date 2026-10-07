@@ -1,6 +1,19 @@
 {
   "run_date": "2026-10-07",
-  "event": "bootstrap",
-  "note": "Scraper state bootstrapped from host 209 (state/ in the Hugging Face dataset). The scrape workflow overwrites this file after every run.",
-  "games_after": 38694
+  "finished_utc": "2026-10-07T07:39:37Z",
+  "event": "workflow_dispatch",
+  "mode": "full",
+  "dry_run": true,
+  "outcome": "success",
+  "games_before": 38694,
+  "games_after": 38694,
+  "new_games": 0,
+  "dataset_rebuilt": true,
+  "dataset_rows": 35873,
+  "dedup_representatives": 25860,
+  "excluded_ps_plus": 2821,
+  "published": "skipped (dry run)",
+  "hf_commit": null,
+  "github_api_token": "GITHUB_TOKEN (fallback)",
+  "workflow_run": "https://github.com/smearle/puzzlescript-gists/actions/runs/37587564165"
 }
