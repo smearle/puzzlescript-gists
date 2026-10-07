@@ -30,6 +30,8 @@ subcommand (pedrosworks.com stopped serving its game list in Oct 2026; its last
 download is kept in staging/pedro) and the empty `search` source are dropped.
 
 GitHub token: read from $GITHUB_TOKEN, else from `gh` (~/.config/gh/hosts.yml).
+Without one, API calls are unauthenticated (60/hour), which is enough for forum,
+wayback and the daily trawl, so `authors` (~1,800 requests) is skipped instead.
 """
 from argparse import ArgumentParser
 from collections import Counter, defaultdict
@@ -60,8 +62,8 @@ GITHUB_LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
 AUTHOR_RE = re.compile(r"(?im)^\s*author\s+(.+?)\s*$")
 
 
-def get_token() -> str:
-    return ghapi.get_token(required=True)
+def get_token():
+    return ghapi.get_token(required=False)
 
 
 def parse_lavelle_filename(stem: str):
@@ -178,7 +180,10 @@ def cmd_authors(master: Path, staging: Path, limit):
     have. /users/{u}/gists is NOT firehose-capped, so this reaches games published
     after Lavelle's snapshot and any the original filter missed.
     """
-    token = get_token()
+    if not get_token():
+        ghapi.warn("no GitHub token: skipping the author enumeration (about 1,800 API requests; "
+                   "unauthenticated calls are limited to 60 per hour). Set GH_SCRAPE_TOKEN to enable it.")
+        return
     out = staging / "users"
     out.mkdir(parents=True, exist_ok=True)
     manifest = out / "_manifest.jsonl"
@@ -284,7 +289,6 @@ def _forum_topic_ids() -> set:
 
 
 def cmd_forum(master: Path, staging: Path):
-    token = get_token()
     out = staging / "forum"
     out.mkdir(parents=True, exist_ok=True)
     manifest = out / "_manifest.jsonl"
@@ -372,7 +376,6 @@ def cdx_gist_ids() -> dict:
 
 
 def cmd_wayback(master: Path, staging: Path):
-    token = get_token()
     out = staging / "wayback"
     out.mkdir(parents=True, exist_ok=True)
     manifest = out / "_manifest.jsonl"

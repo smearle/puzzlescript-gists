@@ -1,8 +1,10 @@
 """GitHub token lookup and a rate-limit-aware GET for the REST API.
 
 The token comes from $GITHUB_TOKEN (the workflow sets it from the
-GH_SCRAPE_TOKEN secret, falling back to the job's built-in token), else from a
-local `gh` login (~/.config/gh/hosts.yml), as in script-doctor.
+GH_SCRAPE_TOKEN secret), else from a local `gh` login (~/.config/gh/hosts.yml),
+as in script-doctor. Without one, calls are unauthenticated (60 requests/hour per
+IP). The workflow's built-in GITHUB_TOKEN is no substitute: it is an app
+installation token, and the gists endpoints answer it with 403.
 
 `api_get` returns the final `requests.Response` exactly like `requests.get`
 would, so callers keep their original status-code handling. It only adds
@@ -38,6 +40,13 @@ def get_token(required: bool = True) -> str | None:
     if required:
         raise SystemExit("No GitHub token: set $GITHUB_TOKEN or run `gh auth login`.")
     return None
+
+
+def warn(msg: str) -> None:
+    """Print a warning (also as a GitHub Actions annotation when running there)."""
+    print(msg, flush=True)
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        print(f"::warning::{msg}", flush=True)
 
 
 def auth_headers(token: str | None) -> dict:

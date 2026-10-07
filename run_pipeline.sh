@@ -12,7 +12,7 @@
 #   FULL             1 = also run the weekly sweep, 0 = never, auto (default) = on Sundays (UTC)
 #   TRAWL_MAX_PAGES  gist search pages to scan at most (default 100)
 #   DEDUP_WORKERS    parallel parser processes for new games (default: nproc)
-#   GITHUB_TOKEN     GitHub token for the REST API (falls back to a local `gh` login)
+#   GITHUB_TOKEN     GitHub token for the REST API (else a local `gh` login, else unauthenticated)
 #   PYTHON           interpreter (default python3)
 set -uo pipefail
 cd "$(dirname "$0")" || exit 1

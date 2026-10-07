@@ -84,6 +84,15 @@ def main() -> None:
         n = max(0, len(r.json()) - 1) if r.ok else 0
         return r.status_code, f"CDX: {n} rows", r.ok and n > 0
 
+    def itch_game():
+        # A game whose page embeds its PuzzleScript source (extracted on host 209).
+        url = "https://jonbro.itch.io/candy-bomb"
+        r = scrape_itch.try_get(url)
+        if r is None:
+            return "error", "game page not served", False
+        src = scrape_itch.get_embedded_source(r.text, url)
+        return r.status_code, f"game page + embed: {len(src or '')} chars of source", bool(src)
+
     def raw_gist():
         g = api.get(f"https://api.github.com/gists/{PROBE_GIST}", timeout=30)
         files = (g.json().get("files") or {}) if g.ok else {}
@@ -96,7 +105,8 @@ def main() -> None:
 
     for name, fn in [("GitHub API rate limit", rate_limit), ("GitHub API gist", gist),
                      ("GitHub API user gists", user_gists), ("raw gist content", raw_gist),
-                     ("gist search (HTML)", gist_search), ("itch.io", itch),
+                     ("gist search (HTML)", gist_search), ("itch.io listing", itch),
+                     ("itch.io game page", itch_game),
                      ("Google Group", google_group), ("Wayback CDX", wayback)]:
         _probe(name, fn)
     if rejected:

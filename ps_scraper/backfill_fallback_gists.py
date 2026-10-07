@@ -56,9 +56,7 @@ def title_candidates():
 
 
 def main():
-    token = B.get_token()
-    H = {"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}",
-         "X-GitHub-Api-Version": "2022-11-28"}
+    H = ghapi.auth_headers(B.get_token())
     t2g = title_candidates()
 
     fallbacks = [json.loads(l) for l in (MASTER / 'manifest.jsonl').read_text().splitlines()

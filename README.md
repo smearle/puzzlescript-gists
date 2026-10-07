@@ -100,13 +100,16 @@ dataset rows themselves still carry no handles.
 | `HF_TOKEN` | uploading the dataset and state | a fine-grained Hugging Face token with write access to `datasets/smearle/puzzlescript-gists` only |
 | `GH_SCRAPE_TOKEN` | the GitHub REST API (gist contents, users' gist lists) | a fine-grained GitHub personal access token: "Public repositories (read-only)", no extra permissions |
 
-Neither secret is required.
+Neither secret is strictly required.
 
 - **Without `HF_TOKEN`**, the workflow runs the whole pipeline but skips the upload, with a
   warning.
-- **Without `GH_SCRAPE_TOKEN`**, it falls back to the job's built-in `GITHUB_TOKEN`. That
-  token allows 1,000 requests per hour, against 5,000 for a personal token, so the Sunday
-  author enumeration is slower.
+- **Without `GH_SCRAPE_TOKEN`**, GitHub API calls are unauthenticated: 60 requests per hour
+  per runner IP, enough for the daily trawl. The weekly author enumeration (about 1,800
+  requests) is then skipped, with a warning.
+
+The job's built-in `GITHUB_TOKEN` is no substitute. It is an app installation token, and
+the gists endpoints answer it with 403 (seen in the first dry run, 2026-10-07).
 
 The first step of every run ("Check access to external sources") prints the GitHub
 rate-limit status and checks that gist search, itch.io, the Google Group and the Wayback

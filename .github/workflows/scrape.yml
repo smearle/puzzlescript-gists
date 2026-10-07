@@ -67,11 +67,12 @@ jobs:
             if [ -n "$GH_SCRAPE_TOKEN" ]; then
               echo "GITHUB_TOKEN_SOURCE=GH_SCRAPE_TOKEN"
             else
-              echo "GITHUB_TOKEN_SOURCE=GITHUB_TOKEN (fallback)"
+              echo "GITHUB_TOKEN_SOURCE=none (unauthenticated)"
             fi
           } >> "$GITHUB_ENV"
           if [ -z "$GH_SCRAPE_TOKEN" ]; then
-            echo "::notice::GH_SCRAPE_TOKEN is not set; using the workflow's GITHUB_TOKEN (1,000 REST API requests per hour)"
+            # The job's built-in GITHUB_TOKEN gets 403 from the gists API, so it is no fallback.
+            echo "::warning::GH_SCRAPE_TOKEN is not set: GitHub API calls are unauthenticated (60 per hour) and the weekly author enumeration is skipped"
           fi
           if [ -z "$HF_TOKEN" ] && [ "$DRY_RUN" != "true" ]; then
             echo "::warning::HF_TOKEN is not set; this run will not upload to Hugging Face"
@@ -80,7 +81,7 @@ jobs:
 
       - name: Check access to external sources
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_SCRAPE_TOKEN || github.token }}
+          GITHUB_TOKEN: ${{ secrets.GH_SCRAPE_TOKEN }}
         run: python -m ps_scraper.check_access
 
       - name: Fetch state from Hugging Face
@@ -88,7 +89,7 @@ jobs:
 
       - name: Run pipeline
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_SCRAPE_TOKEN || github.token }}
+          GITHUB_TOKEN: ${{ secrets.GH_SCRAPE_TOKEN }}
         run: |
           mkdir -p "$PS_WORK_DIR"
           bash run_pipeline.sh 2>&1 | tee "$PS_WORK_DIR/pipeline.log"
