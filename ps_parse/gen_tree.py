@@ -1,0 +1,282 @@
+from dataclasses import dataclass
+from functools import partial
+import logging
+import os
+import pickle
+import re
+import time
+from typing import List, Dict, Optional, Any, Set, Tuple
+import copy
+import random
+
+from lark import Token, Transformer, Tree
+import numpy as np
+
+from ps_parse.ps_game import LegendEntry, PSGameTree, PSObject, Prelude, Rule, RuleBlock, WinCondition
+
+logger = logging.getLogger(__name__)
+
+class GenPSTree(Transformer):
+    """
+    Reduces the parse tree to a minimal functional version of the grammar.
+    """
+    @staticmethod
+    def _parse_screen_dims(value: Optional[str]) -> Optional[Tuple[int, int]]:
+        if value is None:
+            return None
+        match = re.fullmatch(r"\s*(\d+)\s*[xX]\s*(\d+)\s*", value)
+        if match is None:
+            return None
+        return (int(match.group(1)), int(match.group(2)))
+
+    def object_data(self, items):
+        name_line = items[0]
+        name = str(name_line.children[0].children[0]).lower()
+        colors = []
+        color_line = items[1]
+        alt_names = []
+        legend_key = None
+        for i, child in enumerate(name_line.children[1:]):
+            if child.data.value == 'object_name':
+                assert len(child.children) == 1
+                alt_name = str(child.children[0]).lower()
+                alt_names.append(alt_name)
+            elif child.data.value == 'legend_key':
+                assert len(child.children) == 1
+                legend_key = str(child.children[0]).lower()
+                assert len(legend_key) == 1, "Legend key must be a single character"
+                assert len(name_line.children) == i + 2, \
+                    f"Legend key must be the last item in the name line, but found {name_line.children[i+2:]}"
+            else:
+                raise Exception(f'Unrecognized item in object name line: {child}')
+
+        for color in color_line.children:
+            colors.append(str(color))
+        if len(items) < 3:
+            sprite = None
+        else:
+            sprite = np.array([c for c in items[2].children])
+
+        return PSObject(
+            name=name,
+            alt_names=alt_names,
+            legend_key=legend_key,
+            colors=colors,
+            sprite=sprite,
+        )
+
+    def object_line(self, items):
+        assert len(items) == 1
+        items = items[0].children
+        return Tree('object_line', items)
+
+    def rule_object_with_modifier(self, items):
+        items = [it for it in items if not (isinstance(it, Token) and it.type == 'WS_INLINE')]
+        return ' '.join(items)
+
+    def rule_object(self, items):
+        assert len(items) == 1
+        return str(items[0])
+
+    def rule_content(self, items):
+        assert len(items) == 1
+        return str(items[0])
+
+    def cell_border(self, items):
+        return '|'
+
+    def rule_block_once(self, items):
+        # One RuleBlock with possible nesting (right?)
+        # assert len(items) == 1
+        return RuleBlock(looping=False, rules=items)
+
+    def rule_block_loop(self, items):
+        assert (str(items[0]).lower() == 'startloop') and (str(items[-1]).lower() == 'endloop')
+        rules = items[1: -1]
+        return RuleBlock(looping=True, rules=rules)
+
+    def rule_part(self, items):
+        cells = []
+        cell = []
+        for item in items:
+            if item != '|':
+                cell.append(item)
+            else:
+                cells.append(cell)
+                cell = []
+        cells.append(cell)
+        return cells
+
+    def legend_data(self, items):
+        key = items[0].rstrip(' =')
+        # The first entry in this legend key's mapping is just an object name
+        assert len(items[1].children) == 1
+        obj_names = [str(items[1].children[0]).lower()]
+        # Every subsequent item is preceded by an AND or OR legend operator.
+        # They should all be the same
+        operator = None
+        for it in items[2:]:
+            obj_name = str(it.children[1].children[0]).lower()
+            obj_names.append(obj_name)
+            new_op = str(it.children[0]).lower()
+            if operator is not None:
+                assert operator == new_op
+            else:
+                operator = new_op
+
+        return LegendEntry(key=key.lower(), obj_names=obj_names, operator=operator)
+
+    def prefix(self, items):
+        out = str(items[0])
+        if out.lower().startswith('sfx'):
+            return None
+        else:
+            return out.lower()
+
+    def rule_data(self, items):
+        prefixes = []
+        lp = []
+        for i, item in enumerate(items):
+            if isinstance(item, Token) and item.type == 'RULE':
+                raise Exception(f'Unrecognized item in rule data (RULE within a rule?): {item}')
+            if isinstance(item, Token) and item.type == 'THEN':
+                rp = items[i+1:]
+                break
+            elif isinstance(item, Token) and item.type == 'RULE_PREFIX':
+                prefix = str(item).lower()
+                if prefix == 'rigid':
+                    raise NotImplementedError('Rigid prefix not implemented')
+                prefixes.append(prefix)
+                continue
+            # else:
+            #     raise Exception(f'Unrecognized item in rule data: {item}')
+            lp.append(item)
+        lp = [it for it in lp if it is not None]
+        rp = [it for it in rp if it is not None]
+        command = None
+        if len(rp) == 1 and isinstance(rp[0], Tree) and rp[0].data == 'command':
+            if rp[0].children[0].data.value == 'command_keyword':
+                command = rp[0].children[0].children[0].value
+                rp = None
+
+        # filter out sfx
+        new_rps = []
+        if rp is not None:
+            for r in rp:
+                if isinstance(r, Tree) and r.data == 'command':
+                    if r.children[0].data.value == 'sound':
+                        continue
+                    elif r.children[0].data.value == 'command_keyword':
+                        command = r.children[0].children[0].value.lower()
+                        if command in ['again', 'win', 'cancel', 'restart']:
+                            pass
+                        elif command == 'checkpoint':
+                            # ignore this for the sake of RL environments
+                            command = None
+                        else:
+                            breakpoint()
+                else:
+                    new_rps.append(r)
+
+        rule = Rule(
+            prefixes=prefixes,
+            left_patterns = lp,
+            right_patterns = new_rps,
+            command=command
+        )
+        return rule
+    
+    def return_items_lst(self, items):
+        return items
+
+    def objects_section(self, items: List[PSObject]):
+        # new_objects = []
+        # for obj in items:
+        #     alt_names = obj.alt_names
+        #     obj.alt_names = []
+        #     for alt_name in alt_names:
+        #         obj_i = copy.deepcopy(obj)
+        #         obj_i.name = alt_name
+        #         new_objects.append(obj_i)
+        #     new_objects.append(obj)
+        # items = new_objects
+        return {ik.name: ik for ik in items}
+
+    def legend_section(self, items: List[LegendEntry]):
+        legend_dict = {}
+        for it in items:
+            if it.key in legend_dict:
+                logger.warn(f"Conjoined tile {it.key} already in use: k={legend_dict[it.key]}.")
+                continue
+            legend_dict[it.key] = it
+        return legend_dict
+    
+    def layer_data(self, items):
+        obj_names = [str(it.children[0]).lower() for it in items]
+        return obj_names
+
+    def condition_data(self, items):
+        quant = str(items[0])
+        src_obj = str(items[1].children[0]).lower()
+        trg_obj = None
+        if len(items) > 2:
+            trg_obj = str(items[3].children[0]).lower()
+        return WinCondition(quantifier=quant, src_obj=src_obj, trg_obj=trg_obj)
+
+    levels_section = collisionlayers_section = rule_block = rules_section \
+        = winconditions_section = return_items_lst
+
+    def level_data(self, items):
+        return np.vectorize(lambda x: str(x).lower())(items)
+
+    def ps_game(self, items):
+        prelude_items = items[0].children
+        title, author, homepage = None, None, None
+        flickscreen = None
+        zoomscreen = None
+        verbose_logging = False
+        require_player_movement = False
+        run_rules_on_level_start = False
+        for pi in prelude_items:
+            pi_items = pi.children
+            keyword = pi_items[0].lower()
+            value = None
+            if len(pi_items) > 1:
+                value = " ".join(str(item) for item in pi_items[1:])
+            if keyword == 'title':
+                title = value
+            elif keyword == 'author':
+                author = value
+            elif keyword == 'homepage':
+                homepage = value
+            elif keyword == 'flickscreen':
+                flickscreen = self._parse_screen_dims(value)
+            elif keyword == 'zoomscreen':
+                zoomscreen = self._parse_screen_dims(value)
+            elif keyword == 'verbose_logging':
+                verbose_logging = value
+            elif keyword == 'require_player_movement':
+                require_player_movement = True
+            elif keyword == 'run_rules_on_level_start':
+                run_rules_on_level_start = True
+        # assert title is not None
+        return PSGameTree(
+            prelude=Prelude(
+                title=title,
+                author=author,
+                homepage=homepage,
+                flickscreen=flickscreen,
+                zoomscreen=zoomscreen,
+                verbose_logging=verbose_logging,
+                require_player_movement=require_player_movement,
+                run_rules_on_level_start=run_rules_on_level_start,
+            ),
+            objects = items[1],
+            legend=items[2],
+            collision_layers=items[3],
+            rules=items[4],
+            win_conditions=items[5],
+            levels=items[6],
+        )
+
+data_dir = 'data'

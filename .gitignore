@@ -1,0 +1,6 @@
+# Local runs: the unpacked scraper state and scratch outputs never belong in git.
+/state/
+/work/
+__pycache__/
+*.pyc
+.DS_Store

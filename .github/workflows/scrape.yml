@@ -1,0 +1,139 @@
+name: scrape
+
+on:
+  schedule:
+    # Daily at 08:00 UTC. The Sunday (UTC) run also does the weekly sweep:
+    # Google Group, Internet Archive, itch.io and author enumeration.
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+    inputs:
+      full:
+        description: "Also run the weekly sweep (Google Group, Wayback, itch.io, author enumeration)"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Dry run: do everything except the Hugging Face upload"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scrape  # never two runs at once: each run starts from the state the last one published
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    permissions:
+      contents: write  # stats/latest.json commit, which also stops GitHub disabling the schedule
+    defaults:
+      run:
+        shell: bash
+    env:
+      HF_REPO: smearle/puzzlescript-gists
+      DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Configure
+        env:
+          GH_SCRAPE_TOKEN: ${{ secrets.GH_SCRAPE_TOKEN }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          INPUT_FULL: ${{ inputs.full }}
+        run: |
+          {
+            echo "PS_STATE_DIR=$RUNNER_TEMP/state"
+            echo "PS_WORK_DIR=$RUNNER_TEMP/work"
+            if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+              if [ "$INPUT_FULL" = "true" ]; then echo "FULL=1"; else echo "FULL=0"; fi
+            else
+              echo "FULL=auto"  # scheduled: weekly sweep on Sundays
+            fi
+            if [ -n "$GH_SCRAPE_TOKEN" ]; then
+              echo "GITHUB_TOKEN_SOURCE=GH_SCRAPE_TOKEN"
+            else
+              echo "GITHUB_TOKEN_SOURCE=GITHUB_TOKEN (fallback)"
+            fi
+          } >> "$GITHUB_ENV"
+          if [ -z "$GH_SCRAPE_TOKEN" ]; then
+            echo "::notice::GH_SCRAPE_TOKEN is not set; using the workflow's GITHUB_TOKEN (1,000 REST API requests per hour)"
+          fi
+          if [ -z "$HF_TOKEN" ] && [ "$DRY_RUN" != "true" ]; then
+            echo "::warning::HF_TOKEN is not set; this run will not upload to Hugging Face"
+          fi
+          echo "event=$GITHUB_EVENT_NAME dry_run=$DRY_RUN full_input=${INPUT_FULL:-n/a}"
+
+      - name: Check access to external sources
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_SCRAPE_TOKEN || github.token }}
+        run: python -m ps_scraper.check_access
+
+      - name: Fetch state from Hugging Face
+        run: python -m ps_scraper.state fetch
+
+      - name: Run pipeline
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_SCRAPE_TOKEN || github.token }}
+        run: |
+          mkdir -p "$PS_WORK_DIR"
+          bash run_pipeline.sh 2>&1 | tee "$PS_WORK_DIR/pipeline.log"
+
+      - name: Publish to Hugging Face
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          args=(--note "GitHub Actions run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")
+          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          python -m ps_scraper.state publish "${args[@]}"
+
+      - name: Record stats (keepalive commit)
+        if: always()
+        env:
+          PUSH_TOKEN: ${{ github.token }}
+          OUTCOME: ${{ job.status }}
+        run: |
+          python -m ps_scraper.stats --outcome "$OUTCOME"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add stats/latest.json
+          if git diff --cached --quiet; then echo "stats unchanged"; exit 0; fi
+          git commit -q -m "Stats: $(date -u +%F) $GITHUB_EVENT_NAME run, $OUTCOME" \
+            -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+          remote="https://x-access-token:$PUSH_TOKEN@github.com/$GITHUB_REPOSITORY.git"
+          for attempt in 1 2 3; do
+            if git push -q "$remote" "HEAD:$GITHUB_REF_NAME"; then exit 0; fi
+            sleep $((attempt * 5))
+            git pull -q --rebase "$remote" "$GITHUB_REF_NAME"
+          done
+          echo "::error::could not push stats/latest.json"
+          exit 1
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: scrape-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/work/pipeline.log
+            ${{ runner.temp }}/work/run.json
+            ${{ runner.temp }}/work/baseline.json
+            ${{ runner.temp }}/work/summary.json
+            ${{ runner.temp }}/work/ps_plus_remove.txt
+            stats/latest.json
+          if-no-files-found: ignore
+          retention-days: 30

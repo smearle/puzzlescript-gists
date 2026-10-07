@@ -1,0 +1,6 @@
+{
+  "run_date": "2026-10-07",
+  "event": "bootstrap",
+  "note": "Scraper state bootstrapped from host 209 (state/ in the Hugging Face dataset). The scrape workflow overwrites this file after every run.",
+  "games_after": 38694
+}

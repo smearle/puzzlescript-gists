@@ -1,0 +1,556 @@
+"""Tokenize a PuzzleScript game's mechanics into a domain-general integer sequence.
+
+Vendored from script-doctor's ``nca_wm/tokenize_game.py``
+(https://github.com/smearle/script-doctor, MIT); the vocabulary and
+``tokenize_game`` are unchanged, so dedupe fingerprints match.
+
+Converts collision layers, legend groups, rules, and win conditions into a
+flat token sequence suitable for encoding by a transformer or RNN.
+
+The vocabulary describes *typed grid rewrite rules* — a general formalism
+that covers cellular automata, push puzzles, match-3, gravity games, etc.
+The tokenization is name-invariant: objects are referenced by their channel
+index in the multihot state (ch0, ch1, ...), and legend OR/AND groups get
+their own group indices (g0, g1, ...).
+
+Usage:
+    from tokenize_game import tokenize_game, VOCAB
+    tokens = tokenize_game(tree, canonical_ids)
+    # tokens is a list of int token IDs
+"""
+
+from ps_parse.ps_game import PSGameTree, Rule, RuleBlock, LegendEntry
+
+# ---------------------------------------------------------------------------
+# Vocabulary
+# ---------------------------------------------------------------------------
+
+# Special tokens
+_SPECIAL = [
+    "PAD",          # 0 — padding
+    "SEP",          # section/rule separator
+]
+
+# Structure tokens
+_STRUCTURE = [
+    "LAYER",        # collision layer declaration
+    "GROUP_OR",     # legend OR group definition
+    "GROUP_AND",    # legend AND group definition
+]
+
+# Rule tokens
+_RULE = [
+    "RULE",         # rule start
+    "LHS",          # left-hand side
+    "RHS",          # right-hand side
+    "CELL_SEP",     # | between cells
+    "ELLIPSIS",     # ... (wildcard gap)
+    "LOOP_START",
+    "LOOP_END",
+]
+
+# Direction prefixes
+_DIRECTIONS = [
+    "DIR_UP", "DIR_DOWN", "DIR_LEFT", "DIR_RIGHT",
+    "DIR_HORIZONTAL", "DIR_VERTICAL",
+    "DIR_PERPENDICULAR", "DIR_PARALLEL",
+]
+
+# Other rule prefixes
+_PREFIXES = [
+    "LATE", "RANDOM", "RIGID",
+]
+
+# Object modifiers (within a cell)
+_MODIFIERS = [
+    "MOD_PUSH",       # > (moving in rule direction)
+    "MOD_UP",         # ^
+    "MOD_DOWN",       # v
+    "MOD_LEFT",       # <
+    "MOD_NO",         # no (absence check)
+    "MOD_RANDOM",     # random
+    "MOD_RANDOMDIR",  # randomdir
+    "MOD_STATIONARY", # stationary
+]
+
+# Commands
+_COMMANDS = [
+    "CMD_AGAIN",
+    "CMD_CANCEL",
+    "CMD_CHECKPOINT",
+    "CMD_RESTART",
+    "CMD_WIN",
+]
+
+# Win condition tokens
+_WINCOND = [
+    "WIN",          # win condition start
+    "WC_ALL",
+    "WC_SOME",
+    "WC_NO",
+    "WC_ANY",
+    "WC_ON",
+]
+
+# Prelude flags
+_PRELUDE = [
+    "PRE_NOACTION",
+    "PRE_REQUIRE_PLAYER_MOVEMENT",
+    "PRE_RUN_RULES_ON_LEVEL_START",
+]
+
+# Channel references: ch0..ch_MAX. Base vocab covers CH0..CH63;
+# the V2 extension adds CH64..CH(MAX_CHANNELS_V2-1) at the end of the
+# vocab without disturbing existing IDs.
+MAX_CHANNELS = 64
+MAX_CHANNELS_V2 = 384      # covers the largest gallery game (Rose: 355 objs)
+_CHANNELS = [f"CH{i}" for i in range(MAX_CHANNELS)]
+_CHANNELS_V2_EXT = [f"CH{i}" for i in range(MAX_CHANNELS, MAX_CHANNELS_V2)]
+
+# Group references: g0..g_MAX. Same V1/V2 split as channels.
+MAX_GROUPS = 32
+MAX_GROUPS_V2 = 128        # covers the largest gallery game (Rose: 102 groups)
+_GROUPS = [f"G{i}" for i in range(MAX_GROUPS)]
+_GROUPS_V2_EXT = [f"G{i}" for i in range(MAX_GROUPS, MAX_GROUPS_V2)]
+
+# ---- Sprite/visual tokens (opt-in via `encode_sprites=True`) ----
+# Each PuzzleScript object declares:
+#   - a list of 1..N colors (the object's local palette). We resolve named
+#     colors + hex codes to RGB then quantize to a 4x4x4 = 64-bucket grid.
+#   - a 5x5 sprite grid of digits 0-9 (indexing into that palette) or '.'
+# These tokens let us fold that info into the sequence with a bounded vocab.
+_SPRITE_STRUCT = [
+    "OBJ_START",        # start of an object's palette+sprite block
+    "OBJ_END",          # end of the block
+    "PALETTE_START",    # begin palette-color list
+    "SPRITE_START",     # begin 5x5 grid
+    "PIXEL_ROW_SEP",    # end-of-row separator inside sprite grid
+]
+
+# Palette-index tokens: 0-9 plus TRANSPARENT ('.')
+_SPRITE_PIX = [f"PIX{i}" for i in range(10)] + ["PIX_TRANSPARENT"]
+
+# Color tokens: RGB quantized to 2 bits per channel → 64 buckets.
+# (alpha handled via the separate PIX_TRANSPARENT palette-index token.)
+COLOR_Q_BITS = 2
+COLOR_Q_LEVELS = 1 << COLOR_Q_BITS          # 4 levels per channel
+COLOR_Q_TOTAL = COLOR_Q_LEVELS ** 3         # 64 buckets
+_SPRITE_CLRS = [f"COLOR_Q{i:02d}" for i in range(COLOR_Q_TOTAL)]
+
+# Build vocabulary in stacked layers, each appended at the end so token IDs
+# from earlier layers stay stable across vocab extensions:
+#   1. _ALL_TOKENS_BASE (141): mechanics-only. Identical to the original
+#      pre-sprite-tokens tokenizer.
+#   2. + _SPRITE_STRUCT/_PIX/_CLRS → VOCAB_SIZE_EXT (~183). Opt-in via
+#      `encode_sprites=True`.
+#   3. V2 additions (always on):
+#      - KERNEL_SEP: distinguishes multi-kernel rules (`[A|B][C|D] -> [...]`)
+#        from single-kernel ones; without it the two collapse.
+#      - CH64..CH383 and G32..G127: cover the larger gallery games
+#        (Rose has 355 objs and 102 groups; the V1 limits silently
+#        truncate them, dropping all references beyond MAX_*).
+_RULE_V2 = ["KERNEL_SEP"]
+
+# EOS: end-of-sequence marker, mandatorily appended at the tail of each
+# game's token list. Placed at the very end of the vocab so all earlier
+# token IDs stay stable across this addition.
+_END = ["EOS"]
+
+_ALL_TOKENS_BASE = (
+    _SPECIAL + _STRUCTURE + _RULE + _DIRECTIONS + _PREFIXES +
+    _MODIFIERS + _COMMANDS + _WINCOND + _PRELUDE + _CHANNELS + _GROUPS
+)
+_ALL_TOKENS_EXT = _ALL_TOKENS_BASE + _SPRITE_STRUCT + _SPRITE_PIX + _SPRITE_CLRS
+_ALL_TOKENS_EXT_V2 = (
+    _ALL_TOKENS_EXT + _RULE_V2 + _CHANNELS_V2_EXT + _GROUPS_V2_EXT + _END
+)
+
+VOCAB = {tok: i for i, tok in enumerate(_ALL_TOKENS_EXT_V2)}
+VOCAB_SIZE_BASE = len(_ALL_TOKENS_BASE)          # 141 — legacy compat
+VOCAB_SIZE_EXT = len(_ALL_TOKENS_EXT)             # ~183 — with sprite tokens
+VOCAB_SIZE_EXT_V2 = len(_ALL_TOKENS_EXT_V2)       # ~505 — adds V2 + EOS
+VOCAB_SIZE = VOCAB_SIZE_BASE                      # default for legacy callers
+EOS_ID = VOCAB["EOS"]
+INV_VOCAB = {i: tok for tok, i in VOCAB.items()}
+
+
+# ---------------------------------------------------------------------------
+# Modifier / prefix mapping
+# ---------------------------------------------------------------------------
+
+_MODIFIER_MAP = {
+    ">": "MOD_PUSH",
+    "^": "MOD_UP",
+    "v": "MOD_DOWN",
+    "<": "MOD_LEFT",
+    "up": "MOD_UP",
+    "down": "MOD_DOWN",
+    "left": "MOD_LEFT",
+    "right": "MOD_PUSH",
+    "no": "MOD_NO",
+    "random": "MOD_RANDOM",
+    "randomdir": "MOD_RANDOMDIR",
+    "stationary": "MOD_STATIONARY",
+    "horizontal": "DIR_HORIZONTAL",
+    "vertical": "DIR_VERTICAL",
+    "perpendicular": "DIR_PERPENDICULAR",
+    "parallel": "DIR_PARALLEL",
+    "moving": "MOD_PUSH",         # alias used in some games
+    "orthogonal": "DIR_HORIZONTAL",  # rare alias
+}
+
+_PREFIX_MAP = {
+    "up": "DIR_UP",
+    "down": "DIR_DOWN",
+    "left": "DIR_LEFT",
+    "right": "DIR_RIGHT",
+    "horizontal": "DIR_HORIZONTAL",
+    "vertical": "DIR_VERTICAL",
+    "perpendicular": "DIR_PERPENDICULAR",
+    "parallel": "DIR_PARALLEL",
+    "late": "LATE",
+    "random": "RANDOM",
+    "rigid": "RIGID",
+}
+
+_QUANTIFIER_MAP = {
+    "all": "WC_ALL",
+    "some": "WC_SOME",
+    "no": "WC_NO",
+    "any": "WC_ANY",
+}
+
+
+# ---------------------------------------------------------------------------
+# Color resolution + quantization for sprite tokens
+# ---------------------------------------------------------------------------
+# All name→hex resolution goes through puzzlescript_jax.colors, which parses
+# the JS source of truth (PuzzleScript/src/js/colors.js) at import time.
+def _resolve_name_or_hex(s, palette_name=None):
+    # script-doctor resolves sprite colors via puzzlescript_jax.colors (which
+    # parses PuzzleScript's colors.js). The dedupe fingerprint never encodes
+    # sprites (encode_sprites=False), so that module is not vendored here.
+    raise NotImplementedError("sprite encoding is not supported in this slim copy")
+
+
+def _resolve_color_to_rgb(s: str, palette_name: str | None = None):
+    """Thin wrapper around puzzlescript_jax.colors.resolve_color_to_rgb."""
+    return _resolve_name_or_hex(s, palette_name=palette_name)
+
+
+def _quantize_rgb(rgb: tuple[int, int, int]) -> int:
+    """Map (r,g,b) ∈ 0..255 to a bucket index in [0, COLOR_Q_TOTAL)."""
+    shift = 8 - COLOR_Q_BITS   # e.g. 6 for 2-bit quantization
+    r_q = rgb[0] >> shift
+    g_q = rgb[1] >> shift
+    b_q = rgb[2] >> shift
+    return (r_q * COLOR_Q_LEVELS + g_q) * COLOR_Q_LEVELS + b_q
+
+
+def color_q_to_rgb(bucket: int) -> tuple[int, int, int]:
+    """Inverse of _quantize_rgb, returning the bucket's CENTER RGB in 0..255."""
+    levels = COLOR_Q_LEVELS
+    r_q = (bucket // (levels * levels)) % levels
+    g_q = (bucket // levels) % levels
+    b_q = bucket % levels
+    # Map quantized coord 0..L-1 to center of its bucket on 0..255 range
+    step = 256 // levels
+    return (r_q * step + step // 2,
+            g_q * step + step // 2,
+            b_q * step + step // 2)
+
+
+# ---------------------------------------------------------------------------
+# Tokenizer
+# ---------------------------------------------------------------------------
+
+def tokenize_game(
+    tree: PSGameTree,
+    canonical_ids: list[str],
+    encode_sprites: bool = False,
+    include_levels: bool = False,
+) -> list[int]:
+    """Tokenize a PSGameTree into a sequence of integer token IDs.
+
+    KERNEL_SEP is always emitted between adjacent kernels on either side of
+    a rule (so multi-kernel rules like `[A|B][C|D] -> [...]` round-trip
+    faithfully), and the V2 channel/group limits are always used. A single
+    EOS token is unconditionally appended at the tail — it serves as the
+    autoregressive decoder's stop signal; without it the decoder has no
+    learned termination and generation runs to max_seq_len with a garbage
+    tail.
+
+    Args:
+        tree: Parsed game tree (from js_bridge.parsed_state_to_tree or GenPSTree).
+        canonical_ids: list of canonical object names in channel order,
+            as returned by CppPuzzleScriptEnv._canonical_ids.
+            canonical_ids[i] is the object name for multihot channel i.
+        encode_sprites: if True, prepend each object's palette + 5x5 sprite
+            grid to the token sequence. See _SPRITE_STRUCT / _SPRITE_PIX /
+            _SPRITE_CLRS for the vocab extension.
+
+    Returns:
+        List of integer token IDs (always EOS-terminated).
+    """
+    tokens: list[int] = []
+    V = VOCAB  # shorthand
+    max_ch = MAX_CHANNELS_V2
+    max_g = MAX_GROUPS_V2
+
+    # Build name → channel index mapping
+    name_to_ch: dict[str, int] = {}
+    for ch_i, name in enumerate(canonical_ids):
+        name_to_ch[name.lower()] = ch_i
+
+    # Build legend name → group index mapping, and identify which legend
+    # entries are OR/AND groups (not simple aliases)
+    legend: dict[str, LegendEntry] = {}
+    if isinstance(tree.legend, dict):
+        legend = tree.legend
+    elif isinstance(tree.legend, list):
+        for le in tree.legend:
+            if isinstance(le, LegendEntry):
+                legend[le.key] = le
+
+    group_map: dict[str, int] = {}  # legend key → group index
+    group_idx = 0
+    for key, le in legend.items():
+        if le.operator is not None:  # OR or AND group
+            group_map[key] = group_idx
+            group_idx += 1
+
+    # Helper to resolve a name to channel token(s) or a group token
+    def _resolve_name(name: str) -> list[int]:
+        """Resolve an object/legend name to token(s)."""
+        name_l = name.lower()
+        # Direct channel reference
+        if name_l in name_to_ch:
+            ch = name_to_ch[name_l]
+            if ch < max_ch:
+                return [V[f"CH{ch}"]]
+            return []  # skip if beyond max
+        # Legend group reference
+        if name_l in group_map:
+            gi = group_map[name_l]
+            if gi < max_g:
+                return [V[f"G{gi}"]]
+            return []
+        # Legend alias (single object synonym) — resolve to channel
+        if name_l in legend:
+            le = legend[name_l]
+            if le.operator is None and len(le.obj_names) == 1:
+                return _resolve_name(le.obj_names[0])
+        # Unknown — skip
+        return []
+
+    # --- Prelude flags ---
+    if tree.prelude.noaction:
+        tokens.append(V["PRE_NOACTION"])
+    if tree.prelude.require_player_movement:
+        tokens.append(V["PRE_REQUIRE_PLAYER_MOVEMENT"])
+    if tree.prelude.run_rules_on_level_start:
+        tokens.append(V["PRE_RUN_RULES_ON_LEVEL_START"])
+    if tokens:
+        tokens.append(V["SEP"])
+
+    # --- Sprites (opt-in) ---
+    if encode_sprites:
+        # One block per canonical object, in channel order. Each block:
+        #   OBJ_START CH{i} PALETTE_START COLOR_Q* ... SPRITE_START PIX* ... OBJ_END
+        for ch_i, name in enumerate(canonical_ids):
+            if ch_i >= max_ch:
+                break
+            obj = tree.objects.get(name) or tree.objects.get(name.lower())
+            if obj is None:
+                continue
+            tokens.append(V["OBJ_START"])
+            tokens.append(V[f"CH{ch_i}"])
+
+            # Palette: list of quantized color tokens.
+            tokens.append(V["PALETTE_START"])
+            colors = obj.colors if obj.colors is not None else []
+            for c in colors:
+                rgb = _resolve_color_to_rgb(c)
+                if rgb is None:
+                    # Transparent or unresolvable — reuse PIX_TRANSPARENT
+                    # at the palette level rather than adding more vocab.
+                    tokens.append(V["PIX_TRANSPARENT"])
+                else:
+                    tokens.append(V[f"COLOR_Q{_quantize_rgb(rgb):02d}"])
+
+            # Sprite grid (5x5 typically; shorter/odd sprites handled).
+            tokens.append(V["SPRITE_START"])
+            sprite = obj.sprite if obj.sprite is not None else []
+            n_rows = len(sprite)
+            for r in range(n_rows):
+                row = sprite[r]
+                for cell in row:
+                    c = str(cell).strip()
+                    if c == "." or c == "":
+                        tokens.append(V["PIX_TRANSPARENT"])
+                    elif c.isdigit():
+                        d = int(c)
+                        if 0 <= d <= 9:
+                            tokens.append(V[f"PIX{d}"])
+                        else:
+                            tokens.append(V["PIX_TRANSPARENT"])
+                    else:
+                        tokens.append(V["PIX_TRANSPARENT"])
+                if r < n_rows - 1:
+                    tokens.append(V["PIXEL_ROW_SEP"])
+            tokens.append(V["OBJ_END"])
+        tokens.append(V["SEP"])
+
+    # --- Collision layers ---
+    for layer in tree.collision_layers:
+        tokens.append(V["LAYER"])
+        for obj_name in layer:
+            tokens.extend(_resolve_name(obj_name))
+        tokens.append(V["SEP"])
+
+    # --- Legend groups (OR and AND only) ---
+    for key, le in legend.items():
+        if le.operator is None:
+            continue  # skip simple aliases
+        gi = group_map[key]
+        if gi >= max_g:
+            # Drop the entire group declaration if its index exceeds the
+            # vocab range — the prior behavior of emitting just the
+            # GROUP_OR/AND header (with no index) made the chunk
+            # ambiguous, which hopelessly confuses the round-trip.
+            continue
+        if le.operator.lower() == "or":
+            tokens.append(V["GROUP_OR"])
+        elif le.operator.lower() == "and":
+            tokens.append(V["GROUP_AND"])
+        else:
+            continue
+        tokens.append(V[f"G{gi}"])
+        for obj_name in le.obj_names:
+            tokens.extend(_resolve_name(obj_name))
+        tokens.append(V["SEP"])
+
+    # --- Rules ---
+    def _tokenize_rules(rules, in_loop=False):
+        for r in rules:
+            if isinstance(r, RuleBlock):
+                if r.looping:
+                    tokens.append(V["LOOP_START"])
+                _tokenize_rules(r.rules, in_loop=r.looping)
+                if r.looping:
+                    tokens.append(V["LOOP_END"])
+            elif isinstance(r, Rule):
+                _tokenize_rule(r)
+
+    def _tokenize_rule(rule: Rule):
+        tokens.append(V["RULE"])
+        # Prefixes
+        for prefix in rule.prefixes:
+            prefix_l = prefix.lower()
+            if prefix_l in _PREFIX_MAP:
+                tokens.append(V[_PREFIX_MAP[prefix_l]])
+        # LHS
+        tokens.append(V["LHS"])
+        if rule.left_kernels:
+            for ki, part in enumerate(rule.left_kernels):
+                if ki > 0:
+                    tokens.append(V["KERNEL_SEP"])
+                _tokenize_kernel(part)
+        # RHS
+        tokens.append(V["RHS"])
+        if rule.right_kernels:
+            for ki, part in enumerate(rule.right_kernels):
+                if ki > 0:
+                    tokens.append(V["KERNEL_SEP"])
+                _tokenize_kernel(part)
+        # Command
+        if rule.command:
+            cmd = rule.command.lower()
+            cmd_tok = {
+                "again": "CMD_AGAIN",
+                "cancel": "CMD_CANCEL",
+                "checkpoint": "CMD_CHECKPOINT",
+                "restart": "CMD_RESTART",
+                "win": "CMD_WIN",
+            }.get(cmd)
+            if cmd_tok:
+                tokens.append(V[cmd_tok])
+        tokens.append(V["SEP"])
+
+    def _tokenize_kernel(cells: list):
+        """Tokenize a kernel (list of cells, each cell is a list of token strings)."""
+        for cell_i, cell in enumerate(cells):
+            if cell_i > 0:
+                tokens.append(V["CELL_SEP"])
+            if isinstance(cell, str):
+                cell_tokens = cell.split()
+            elif isinstance(cell, list):
+                cell_tokens = []
+                for t in cell:
+                    if isinstance(t, str):
+                        cell_tokens.extend(t.split())
+                    elif isinstance(t, list):
+                        for tt in t:
+                            cell_tokens.extend(str(tt).split())
+            else:
+                continue
+
+            for tok in cell_tokens:
+                tok_l = tok.lower()
+                if tok_l == "...":
+                    tokens.append(V["ELLIPSIS"])
+                elif tok_l in _MODIFIER_MAP:
+                    tokens.append(V[_MODIFIER_MAP[tok_l]])
+                else:
+                    # Object or legend reference
+                    tokens.extend(_resolve_name(tok_l))
+
+    _tokenize_rules(tree.rules)
+
+    # --- Win conditions ---
+    for wc in tree.win_conditions:
+        tokens.append(V["WIN"])
+        q = wc.quantifier.lower()
+        if q in _QUANTIFIER_MAP:
+            tokens.append(V[_QUANTIFIER_MAP[q]])
+        if wc.src_obj:
+            tokens.extend(_resolve_name(wc.src_obj))
+        if wc.trg_obj:
+            tokens.append(V["WC_ON"])
+            tokens.extend(_resolve_name(wc.trg_obj))
+        tokens.append(V["SEP"])
+
+    # --- Levels (opt-in; used by level-aware dedup, NOT by game-spec
+    # conditioning) ---
+    # Each cell is resolved through the legend to canonical channel/group
+    # tokens, so the fingerprint is name-invariant (renamed-but-identical
+    # games still collapse) while genuinely different level layouts produce
+    # different token streams. Cell/row/level boundaries reuse existing
+    # separator tokens, so no vocab change is needed.
+    if include_levels:
+        import numpy as _np
+        levels = getattr(tree, "levels", None)
+        if levels is None:
+            levels = []
+        for level in levels:
+            arr = _np.asarray(level)
+            # Levels come as (1, H, W) (or (H, W)) single-char arrays; collapse
+            # to a 2-D (H, W) char grid (last two axes are the grid).
+            if arr.ndim >= 2:
+                grid = arr.reshape(arr.shape[-2], arr.shape[-1])
+            else:
+                continue
+            tokens.append(V["SEP"])          # level boundary
+            for r in range(grid.shape[0]):
+                for cc in range(grid.shape[1]):
+                    tokens.extend(_resolve_name(str(grid[r, cc])))
+                    tokens.append(V["CELL_SEP"])
+                tokens.append(V["PIXEL_ROW_SEP"])  # row boundary
+
+    tokens.append(EOS_ID)
+    return tokens
+
+
+def tokens_to_str(token_ids: list[int]) -> str:
+    """Convert token IDs back to readable string for debugging."""
+    return " ".join(INV_VOCAB.get(t, f"?{t}") for t in token_ids)
