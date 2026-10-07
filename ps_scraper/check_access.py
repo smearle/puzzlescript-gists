@@ -2,13 +2,16 @@
 
 Prints one line per source (HTTP status, a parsed count, latency) so a run's log
 shows at a glance whether GitHub, gist search, itch.io, the Google Group or the
-Wayback Machine is blocking this runner. Informational only: it always exits 0,
-emitting a GitHub Actions warning for each source that looks blocked.
+Wayback Machine is blocking this runner. Informational: each source that looks blocked
+gets a GitHub Actions warning. The one hard failure is the GitHub API rejecting
+the token (401), e.g. an expired GH_SCRAPE_TOKEN: every gist download would then
+fail while the run still looked green, so that exits 1.
 """
 from __future__ import annotations
 
 import os
 import re
+import sys
 import time
 
 import requests
@@ -38,8 +41,12 @@ def main() -> None:
     api.headers.update(ghapi.auth_headers(token))
     print(f"external sources (GitHub token: {'set' if token else 'none'}):")
 
+    rejected = []
+
     def rate_limit():
         r = api.get("https://api.github.com/rate_limit", timeout=30)
+        if r.status_code == 401:
+            rejected.append(r.status_code)
         core = r.json().get("resources", {}).get("core", {}) if r.ok else {}
         return r.status_code, f"core limit={core.get('limit')} remaining={core.get('remaining')}", r.ok
 
@@ -92,6 +99,10 @@ def main() -> None:
                      ("gist search (HTML)", gist_search), ("itch.io", itch),
                      ("Google Group", google_group), ("Wayback CDX", wayback)]:
         _probe(name, fn)
+    if rejected:
+        print("::error::the GitHub API rejected the token (401 Bad credentials); "
+              "renew the GH_SCRAPE_TOKEN secret (or delete it to use the workflow token)")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
