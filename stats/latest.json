@@ -1,19 +1,19 @@
 {
-  "run_date": "2026-10-18",
-  "finished_utc": "2026-10-18T14:54:33Z",
+  "run_date": "2026-10-19",
+  "finished_utc": "2026-10-19T16:57:23Z",
   "event": "schedule",
-  "mode": "full",
+  "mode": "daily",
   "dry_run": false,
   "outcome": "success",
   "games_before": 38694,
-  "games_after": 38788,
-  "new_games": 94,
+  "games_after": 38804,
+  "new_games": 110,
   "dataset_rebuilt": true,
-  "dataset_rows": 35967,
-  "dedup_representatives": 25929,
+  "dataset_rows": 35983,
+  "dedup_representatives": 25943,
   "excluded_ps_plus": 2821,
   "published": "skipped (no HF_TOKEN)",
   "hf_commit": null,
   "github_api_token": "none (unauthenticated)",
-  "workflow_run": "https://github.com/smearle/puzzlescript-gists/actions/runs/39126396259"
+  "workflow_run": "https://github.com/smearle/puzzlescript-gists/actions/runs/39274724674"
 }
