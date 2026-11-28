@@ -1,6 +1,6 @@
 {
-  "run_date": "2026-11-27",
-  "finished_utc": "2026-11-27T22:41:46Z",
+  "run_date": "2026-11-28",
+  "finished_utc": "2026-11-28T21:27:23Z",
   "event": "schedule",
   "mode": null,
   "dry_run": false,
@@ -15,5 +15,5 @@
   "published": null,
   "hf_commit": null,
   "github_api_token": "none (unauthenticated)",
-  "workflow_run": "https://github.com/smearle/puzzlescript-gists/actions/runs/46043811263"
+  "workflow_run": "https://github.com/smearle/puzzlescript-gists/actions/runs/46165222159"
 }
